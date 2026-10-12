@@ -42,6 +42,8 @@ Supporting modules:
   max 1 open per token, max 3 open total, TP +25% / SL −15%).
   Re-entry on a token only after its previous position closed.
   Each run closes TP/SL hits BEFORE recording new signals.
+  Token hilang dari scout 2 run berturut-turut = write-off
+  "⚠️ HILANG (kemungkinan rug)": dinilai rugi total (−Rp40.000 − biaya masuk).
   (each ×2): Axiom fee 0.95% + priority fee 0.001 SOL (Rp2.000 at
   1 SOL = Rp2.000.000) + DEX fee 0.25% + slippage 2% (1% if liquidity > $100k).
   P&L is reported gross vs net (after costs).

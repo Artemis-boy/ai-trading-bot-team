@@ -52,7 +52,8 @@ def conn():
     # migrate old DBs
     cols = {r[1] for r in c.execute("PRAGMA table_info(positions)")}
     for col, typ in [("entry_cost_usd", "REAL DEFAULT 0"), ("exit_cost_usd", "REAL DEFAULT 0"),
-                     ("pnl_gross_usd", "REAL DEFAULT 0"), ("liquidity_usd", "REAL DEFAULT 0")]:
+                     ("pnl_gross_usd", "REAL DEFAULT 0"), ("liquidity_usd", "REAL DEFAULT 0"),
+                     ("miss_count", "INTEGER DEFAULT 0")]:
         if col not in cols:
             c.execute(f"ALTER TABLE positions ADD COLUMN {col} {typ}")
     return c
@@ -88,8 +89,21 @@ def mark_to_market(price_map_usd):
             "SELECT id,mint,symbol,entry_usd,size_usd,tp_pct,sl_pct,"
             "entry_cost_usd,liquidity_usd FROM positions WHERE status='open'"):
         if mint not in price_map or not price_map[mint]:
+            c.execute("UPDATE positions SET miss_count=COALESCE(miss_count,0)+1 WHERE id=?",
+                      (pid,))
+            miss = c.execute("SELECT miss_count FROM positions WHERE id=?",
+                             (pid,)).fetchone()[0]
+            if (miss or 0) >= 2:
+                # ⚠️ HILANG 2 run berturut-turut (kemungkinan rug): rugi total.
+                net = round(-(size or 0) - (ecost or 0), 0)
+                c.execute("UPDATE positions SET status='closed',closed_at=?,exit_usd=0,"
+                          "pnl_usd=?,pnl_gross_usd=?,exit_reason=? WHERE id=?",
+                          (datetime.now(timezone.utc).isoformat(), net,
+                           round(-(size or 0), 0), "⚠️ HILANG (kemungkinan rug)", pid))
+                closed.append((sym, "⚠️ HILANG (kemungkinan rug)", net))
             continue
         px = float(price_map[mint])
+        c.execute("UPDATE positions SET miss_count=0 WHERE id=?", (pid,))
         pct = (px - entry) / entry * 100
         reason = None
         if pct >= tp:
@@ -114,11 +128,19 @@ def unrealized(price_map_usd):
     """(unreal_gross, unreal_net, per-mint net dict) for open positions, IDR."""
     price_map = {m: usd_to_idr(p) for m, p in (price_map_usd or {}).items() if p}
     c = conn()
-    rows = c.execute("SELECT mint,entry_usd,size_usd,entry_cost_usd,liquidity_usd"
-                     " FROM positions WHERE status='open'").fetchall()
+    rows = c.execute("SELECT mint,entry_usd,size_usd,entry_cost_usd,liquidity_usd,"
+                     "COALESCE(miss_count,0) FROM positions WHERE status='open'").fetchall()
     c.close()
     ug, un, per = 0.0, 0.0, {}
-    for mint, entry, size, ecost, liq in rows:
+    for mint, entry, size, ecost, liq, miss in rows:
+        if (miss or 0) >= 1 and not price_map.get(mint):
+            # hilang dari scout: nilai interim rugi total (-size - biaya masuk)
+            gross = -(size or 0)
+            net = gross - (ecost or 0)
+            ug += gross
+            un += net
+            per[mint] = round(net, 0)
+            continue
         px = price_map.get(mint)
         if not px or not entry:
             continue

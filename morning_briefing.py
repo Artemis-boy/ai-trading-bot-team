@@ -101,8 +101,8 @@ def main():
     rg, rn, closed_costs = ledger.totals()
 
     c = sqlite3.connect(ROOT / "data" / "paper.db")
-    opens = c.execute("SELECT symbol,entry_usd,size_usd,mint FROM positions "
-                      "WHERE status='open' ORDER BY id").fetchall()
+    opens = c.execute("SELECT symbol,entry_usd,size_usd,mint,COALESCE(miss_count,0) "
+                      "FROM positions WHERE status='open' ORDER BY id").fetchall()
     realized, n_closed = c.execute("SELECT COALESCE(SUM(pnl_usd),0),COUNT(*) "
                                    "FROM positions WHERE status='closed'").fetchone()
     all_closed = c.execute("SELECT symbol,entry_usd,exit_usd,pnl_usd,pnl_gross_usd,exit_reason "
@@ -111,13 +111,16 @@ def main():
                            "WHERE status='open'").fetchone()[0]
     c.close()
 
-    open_lines = []
-    for sym, entry, size, mint in opens:
+    open_lines, miss_lines = [], []
+    for sym, entry, size, mint, miss in opens:
         now_usd = prices.get(mint)
         now = ledger.usd_to_idr(now_usd) if now_usd else None
         pnl = per_mint.get(mint, 0.0)
-        now_s = rp(now) if now else "n/a (hilang dari scout)"
-        open_lines.append(f"- {sym} | entry {rp(entry)} → now {now_s} | P&L {rp_signed(pnl)}")
+        if now is None:
+            miss_lines.append(f"- {sym} | entry {rp(entry)} | "
+                              f"⚠️ HILANG (kemungkinan rug) | dinilai {rp_signed(pnl)}")
+        else:
+            open_lines.append(f"- {sym} | entry {rp(entry)} → now {rp(now)} | P&L {rp_signed(pnl)}")
 
     gross_total = rg + ug
     net_total = rn + un
@@ -140,9 +143,11 @@ def main():
            f"💰 Bankroll virtual: Rp{bankroll:,.0f} (awal Rp200.000)\n"
            f"📈 P&L total: {rp_signed(net_total)} ({pct:+.2f}%) — "
            f"kotor {rp_signed(gross_total)} vs bersih {rp_signed(net_total)} (setelah biaya)\n"
-           f"\n🟢 POSISI TERBUKA ({len(opens)}/3):\n"
+           f"\n🟢 POSISI TERBUKA ({len(open_lines)}/3):\n"
            + ("\n".join(open_lines) if open_lines else "- tidak ada posisi terbuka") + "\n"
-           f"\n🎯 SINYAL RUN INI ({len(decs)} kandidat):\n"
+           + (f"\n⚠️ POSISI HILANG ({len(miss_lines)}):\n" + "\n".join(miss_lines) + "\n"
+              if miss_lines else "")
+           + f"\n🎯 SINYAL RUN INI ({len(decs)} kandidat):\n"
            + "\n".join(sig_lines) + "\n"
            f"\n🤖 STATUS AGEN: {agen}")
 
@@ -153,8 +158,12 @@ def main():
            f"P&L kotor {rp_signed(gross_total)} vs bersih {rp_signed(net_total)} ({pct:+.2f}%) "
            f"= realisasi bersih {rp_signed(rn)} (biaya closed {rp_signed(-closed_costs)}) "
            f"+ unrealisasi bersih {rp_signed(un)} (biaya open {rp_signed(-(open_costs or 0))}).",
-           f"Posisi: {len(opens)} terbuka, {n_closed} tertutup. "
+           f"Posisi: {len(open_lines)} terbuka bernilai, "
+           f"{len(miss_lines)} hilang (dinilai rugi total), {n_closed} tertutup. "
            f"Sinyal baru dicatat: {n_new}.", ""]
+    if miss_lines:
+        det.append("⚠️ POSISI HILANG (tak ada di scout, dinilai rugi total):")
+        det += miss_lines + [""]
     if newly_closed:
         det.append("Posisi tertutup pada run ini:")
         det += [f"- {s}: {r} (P&L bersih {rp_signed(p)})" for s, r, p in newly_closed] + [""]
