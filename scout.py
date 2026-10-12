@@ -19,12 +19,22 @@ MIN_LIQUIDITY_USD = 10_000
 MAX_PAIR_AGE_DAYS = 14
 MAX_RESULTS = 20
 TIMEOUT = 20
+DELAY_S = 1.0  # DexScreener free-tier courtesy delay per token
 
 
-def get(url):
-    r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": "ai-trading-bot-team/research"})
-    r.raise_for_status()
-    return r.json()
+def get(url, retries=2):
+    last = None
+    for _ in range(retries + 1):
+        try:
+            r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": "ai-trading-bot-team/research"})
+            if r.status_code == 429:
+                raise RuntimeError("429 rate-limited")
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(3)
+    raise RuntimeError(f"fetch tak tersedia: {last}")
 
 
 def latest_profiles():
@@ -56,7 +66,9 @@ def scout(min_liquidity=MIN_LIQUIDITY_USD, max_age_days=MAX_PAIR_AGE_DAYS, limit
             pairs = [x for x in token_pairs(mint) if x.get("chainId") == "solana"]
         except Exception as e:
             print(f"  ! pairs fetch failed for {mint[:8]}: {e}")
+            time.sleep(DELAY_S)
             continue
+        time.sleep(DELAY_S)
         if not pairs:
             continue
         # pick highest-liquidity pair

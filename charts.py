@@ -9,6 +9,7 @@ pattern matching (named setups) -> signal (bullish/bearish/chop score).
 Paper-trading research only. No wallets, no private keys, no live orders.
 """
 import json
+import time
 from pathlib import Path
 
 import requests
@@ -16,14 +17,24 @@ import requests
 BASE = "https://api.dexscreener.com"
 CACHE = Path(__file__).parent / "cache"
 TIMEOUT = 20
+DELAY_S = 1.5  # DexScreener free-tier courtesy delay
 
 
-def fetch_pair(chain, pair_addr):
-    r = requests.get(f"{BASE}/latest/dex/pairs/{chain}/{pair_addr}",
-                     timeout=TIMEOUT, headers={"User-Agent": "ai-trading-bot-team/research"})
-    r.raise_for_status()
-    pairs = r.json().get("pairs") or []
-    return pairs[0] if pairs else None
+def fetch_pair(chain, pair_addr, retries=2):
+    last = None
+    for _ in range(retries + 1):
+        try:
+            r = requests.get(f"{BASE}/latest/dex/pairs/{chain}/{pair_addr}",
+                             timeout=TIMEOUT, headers={"User-Agent": "ai-trading-bot-team/research"})
+            if r.status_code == 429:
+                raise RuntimeError("429 rate-limited")
+            r.raise_for_status()
+            pairs = r.json().get("pairs") or []
+            return pairs[0] if pairs else None
+        except Exception as e:
+            last = e
+            time.sleep(3)
+    raise RuntimeError(f"pair fetch unavailable: {last}")
 
 
 def ladder(pair):
@@ -71,8 +82,9 @@ def analyze(cands):
             print(f"  {c['symbol']}: {pat} mom={ind['momentum']} vol={ind['volatility']} score={score}")
         except Exception as e:
             ch = {"error": str(e), "chart_score_0_100": None}
-            print(f"  {c['symbol']}: chart FAILED ({e})")
+            print(f"  {c['symbol']}: chart tak tersedia ({e})")
         out.append({**c, "chart": ch})
+        time.sleep(DELAY_S)
     return out
 
 

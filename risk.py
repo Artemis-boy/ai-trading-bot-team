@@ -5,8 +5,13 @@ Rules (each adds points, capped 1-10):
   CoinGecko unlisted: +1 (listed & scored: -1, min floor applies)
   top1 holder > 30%: +2 | > 15%: +1 | holder data unknown: +1
   top5 holders > 60%: +2 | > 40%: +1
+  whale concentration top10 tinggi: +2 | sedang: +1 | tak tersedia: +1
+  whale distribusi (keluar): +1
   chart volatility > 500: +2 | > 200: +1 | chart unknown: +1
   pair age < 1 day: +1 (brand-new = rug window)
+
+Whale data is supporting evidence, not a verdict: a big wallet can be the
+team, a CEX, a market maker, or a bandar — identity is unknown.
 
 Paper-trading research only. No wallets, no private keys, no live orders.
 """
@@ -57,11 +62,30 @@ def score(c):
     if (c.get("pair_age_days") or 99) < 1:
         pts += 1; reasons.append("age<1d +1")
 
+    w = c.get("whale") or {}
+    if "whale" not in c:
+        pts += 1; reasons.append("whale belum jalan +1")
+    conc = w.get("concentration")
+    if conc == "tinggi":
+        pts += 2; reasons.append(f"whale top10 {w.get('top10_pct')}% tinggi +2")
+    elif conc == "sedang":
+        pts += 1; reasons.append(f"whale top10 {w.get('top10_pct')}% sedang +1")
+    elif conc == "tak tersedia" or w.get("unavailable"):
+        pts += 1; reasons.append("whale-data tak tersedia +1")
+    if w.get("status") == "distribusi":
+        pts += 1; reasons.append("whale distribusi +1")
+    elif w.get("status") == "akumulasi":
+        pts -= 1; reasons.append("whale akumulasi -1")
+
     return max(1, min(10, pts)), reasons
 
 
 def main():
-    cands = json.loads((CACHE / "charts_latest.json").read_text())
+    src = CACHE / "whale_latest.json"
+    if not src.exists():
+        src = CACHE / "charts_latest.json"
+        print("[risk] whale_latest.json tak ada, pakai charts_latest.json (whale +1)")
+    cands = json.loads(src.read_text())
     out = []
     print(f"[risk] scoring {len(cands)} candidates...")
     for c in cands:
