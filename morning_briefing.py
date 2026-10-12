@@ -1,9 +1,11 @@
 """Morning briefing runner: full paper-trading pipeline -> daily report file + briefing text.
 
 SIMULATION ONLY. No wallets, no private keys, no live orders.
-Steps: scout -> news -> sentiment -> charts -> whale -> risk -> decision ->
-mark-to-market open paper positions -> record new AMBIL signals ->
-write reports/YYYY-MM-DD.md -> git commit+push -> print briefing (stdout).
+Pipeline v2: scout -> news -> sentiment -> charts -> risk -> decision ->
+whale -> paper_ledger -> report.
+Whale runs after decision; risk scores use the previous whale snapshot
+(file-per-stage, degrades gracefully). Display merges today's whale by mint.
+Steps: run agents -> mark-to-market -> record AMBIL -> write
 """
 import json
 import os
@@ -15,10 +17,11 @@ from pathlib import Path
 
 ROOT = Path("C:/Users/ikraa/Documents/ai-trading-bot-team")
 PY = str(ROOT / "venv" / "Scripts" / "python.exe")
-START = 100.0
-AGENTS = ["scout", "news", "sentiment", "charts", "whale", "risk", "decision"]
+START = 200_000  # Rp
+AGENTS = ["scout", "news", "sentiment", "charts", "risk", "decision", "whale"]
+EXTRA_STEPS = ["paper_ledger", "report"]
 NAMES = {"scout": "Scout", "news": "News", "sentiment": "Sentiment",
-         "charts": "Charts", "whale": "Whale", "risk": "Risk", "decision": "Decision"}
+         "charts": "Charts", "risk": "Risk", "decision": "Decision", "whale": "Whale"}
 WHALE_ICON = {"akumulasi": "🐋 akumulasi", "distribusi": "🐋 distribusi",
               "netral": "netral"}
 
@@ -30,17 +33,31 @@ def sh(args):
 
 
 def money(x):
-    return ("$%g" % x) if x else "-"
+    return (f"Rp{x:,.0f}") if x else "-"
+
+
+def rp(x):
+    if x is None:
+        return "-"
+    return f"Rp{float(x):,.0f}"
+
+
+def rp_signed(x):
+    x = float(x or 0)
+    sign = "+" if x >= 0 else "-"
+    return f"{sign}Rp{abs(x):,.0f}"
 
 
 def signed(x):
-    return f"${x:+.2f}"
+    x = float(x or 0)
+    sign = "+" if x >= 0 else "-"
+    return f"{sign}Rp{abs(x):,.0f}"
 
 
 def main():
     day = datetime.now().strftime("%Y-%m-%d")
     status = {}
-    for a in AGENTS:
+    for a in AGENTS + EXTRA_STEPS:
         r = sh([PY, f"{a}.py"])
         status[a] = (r.returncode == 0)
         if r.returncode != 0:
@@ -51,8 +68,19 @@ def main():
 
     dec_path = ROOT / "cache" / "decision_latest.json"
     if not dec_path.exists():
-        dec_path = ROOT / "cache" / "whale_latest.json"
+        dec_path = ROOT / "cache" / "risk_latest.json"
     decs = json.loads(dec_path.read_text())
+    whale_path = ROOT / "cache" / "whale_latest.json"
+    whale_by_mint = {}
+    if whale_path.exists():
+        try:
+            for w in json.loads(whale_path.read_text()):
+                whale_by_mint[w.get("mint")] = w.get("whale") or {}
+        except Exception as e:
+            print(f"[briefing] whale cache unreadable: {e}", file=sys.stderr)
+    for d in decs:
+        if not d.get("whale") and d.get("mint") in whale_by_mint:
+            d["whale"] = whale_by_mint[d["mint"]]
     prices = {}
     for d in decs:
         try:
@@ -79,10 +107,11 @@ def main():
 
     open_lines = []
     for sym, entry, size, mint in opens:
-        now = prices.get(mint)
+        now_usd = prices.get(mint)
+        now = ledger.usd_to_idr(now_usd) if now_usd else None
         pnl = per_mint.get(mint, 0.0)
-        now_s = money(now) if now else "n/a (hilang dari scout)"
-        open_lines.append(f"- {sym} | entry {money(entry)} → now {now_s} | P&L {signed(pnl)}")
+        now_s = rp(now) if now else "n/a (hilang dari scout)"
+        open_lines.append(f"- {sym} | entry {rp(entry)} → now {now_s} | P&L {rp_signed(pnl)}")
 
     gross_total = rg + ug
     net_total = rn + un
@@ -94,16 +123,17 @@ def main():
         ch = d.get("chart") or {}
         w = d.get("whale") or {}
         wtxt = WHALE_ICON.get(w.get("status"), w.get("status") or "netral")
+        liq_idr = (d.get("liquidity_usd") or 0) * ledger.USD_IDR
         sig_lines.append(f"- {d.get('signal')} {d.get('symbol')} | skor {d.get('total_score')} "
                          f"| risk {d.get('risk_1_10')}/10 | pola {ch.get('pattern')} "
-                         f"| liq ${(d.get('liquidity_usd') or 0):,.0f} | {wtxt}")
+                         f"| liq Rp{liq_idr:,.0f} | {wtxt}")
 
     agen = " | ".join(f"{NAMES[a]} {'✅' if status[a] else '❌'}" for a in AGENTS)
 
     msg = (f"📊 LAPORAN HARIAN — {day}\n"
-           f"💰 Bankroll virtual: ${bankroll:.2f} (awal $100)\n"
-           f"📈 P&L total: {signed(net_total)} ({pct:+.2f}%) — "
-           f"kotor {signed(gross_total)} vs bersih {signed(net_total)} (setelah biaya)\n"
+           f"💰 Bankroll virtual: Rp{bankroll:,.0f} (awal Rp200.000)\n"
+           f"📈 P&L total: {rp_signed(net_total)} ({pct:+.2f}%) — "
+           f"kotor {rp_signed(gross_total)} vs bersih {rp_signed(net_total)} (setelah biaya)\n"
            f"\n🟢 POSISI TERBUKA ({len(opens)}):\n"
            + ("\n".join(open_lines) if open_lines else "- tidak ada posisi terbuka") + "\n"
            f"\n🎯 SINYAL HARI INI ({len(decs)} kandidat):\n"
@@ -113,19 +143,19 @@ def main():
     rep = ROOT / "reports" / f"{day}.md"
     rep.parent.mkdir(exist_ok=True)
     det = [f"# Laporan Harian — {day}", "",
-           f"Bankroll virtual: ${bankroll:.2f} (awal $100)",
-           f"P&L kotor {signed(gross_total)} vs bersih {signed(net_total)} ({pct:+.2f}%) "
-           f"= realisasi bersih {signed(rn)} (biaya closed {signed(-closed_costs)}) "
-           f"+ unrealisasi bersih {signed(un)} (biaya open {signed(-(open_costs or 0))}).",
+           f"Bankroll virtual: Rp{bankroll:,.0f} (awal Rp200.000)",
+           f"P&L kotor {rp_signed(gross_total)} vs bersih {rp_signed(net_total)} ({pct:+.2f}%) "
+           f"= realisasi bersih {rp_signed(rn)} (biaya closed {rp_signed(-closed_costs)}) "
+           f"+ unrealisasi bersih {rp_signed(un)} (biaya open {rp_signed(-(open_costs or 0))}).",
            f"Posisi: {len(opens)} terbuka, {n_closed} tertutup. "
            f"Sinyal baru dicatat: {n_new}.", ""]
     if newly_closed:
         det.append("Posisi tertutup pada run ini:")
-        det += [f"- {s}: {r} (P&L bersih {signed(p)})" for s, r, p in newly_closed] + [""]
+        det += [f"- {s}: {r} (P&L bersih {rp_signed(p)})" for s, r, p in newly_closed] + [""]
     if all_closed:
         det.append("Riwayat posisi tertutup:")
-        det += [f"- {s}: entry {money(e)} -> exit {money(x)} | bersih {signed(p)} "
-                f"(kotor {signed(g)}) | {r}"
+        det += [f"- {s}: entry {rp(e)} -> exit {rp(x)} | bersih {rp_signed(p)} "
+                f"(kotor {rp_signed(g)}) | {r}"
                 for s, e, x, p, g, r in all_closed] + [""]
     det.append("Keputusan hari ini:")
     for d in decs:
@@ -133,13 +163,14 @@ def main():
         det.append(f"- [{d.get('signal')}] {d.get('symbol')} "
                    f"skor={d.get('total_score')} risk={d.get('risk_1_10')}/10 "
                    f"pola={(d.get('chart') or {}).get('pattern')} "
-                   f"liq=${(d.get('liquidity_usd') or 0):,.0f} "
+                   f"liq=Rp{(d.get('liquidity_usd') or 0) * ledger.USD_IDR:,.0f} "
                    f"whale={w.get('status')} ({w.get('concentration')})")
         det.append(f"  alasan: {'; '.join(d.get('decision_reasons', []))}")
         if w.get("note"):
             det.append(f"  whale: {w.get('note')}")
-    det += ["", "Biaya: gas $0.05/tx + fee DEX 0.25% + slippage 2% (1% jika liq > $100k), "
-            "dipotong tiap buka & tutup posisi.",
+    det += ["", "Biaya model Axiom: fee Axiom 0,95% + priority fee 0,001 SOL "
+            "(Rp2.000, kurs 1 SOL = Rp2.000.000) + fee DEX 0,25% + slippage 2% "
+            "(1% jika liq > $100k) — dipotong tiap buka & tutup posisi.",
             "SIMULASI EDUKASI — bukan nasihat finansial. Tanpa uang asli."]
     rep.write_text("\n".join(det))
 
