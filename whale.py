@@ -1,8 +1,9 @@
 """Agent 7 - WHALE: daily top-holder snapshots + accumulation/distribution detection.
 
-Sources: RugCheck free report (topHolders, no key) first; Solana public RPC
-getTokenLargestAccounts as fallback. Rate-limit safe: per-token try/except,
-courtesy delays, never crash — unavailable data is recorded, not fatal.
+Sources: Solana public RPC getTokenLargestAccounts FIRST (per spec);
+RugCheck free report as fallback. Rate-limit safe: per-token try/except,
+courtesy delays, retries with backoff, never crash — unavailable data is
+recorded, not fatal.
 
 Snapshots: data/whale.db -> snapshots(day, mint, symbol, top10_pct, holders_json).
 Detection vs previous snapshot for same mint:
@@ -77,7 +78,17 @@ def rpc_top(mint):
 
 
 def fetch_top20(mint):
-    """Return (holdings, source) where holdings = [(address, pct)]."""
+    """Return (holdings, source) where holdings = [(address, pct)].
+    Order: public RPC first (spec), RugCheck fallback."""
+    try:
+        accts = rpc_top(mint)
+        total = sum(float(a.get("uiAmount", 0) or 0) for a in accts) or 1
+        rows = sorted(((a.get("address", "?"),
+                        float(a.get("uiAmount", 0) or 0) / total * 100)
+                       for a in accts), key=lambda x: -x[1])[:20]
+        return rows, "rpc"
+    except Exception as e:
+        err_rpc = str(e)
     try:
         holders = rugcheck_top(mint)
         if holders:
@@ -88,15 +99,7 @@ def fetch_top20(mint):
         err_rc = str(e)
     else:
         err_rc = "empty"
-    try:
-        accts = rpc_top(mint)
-        total = sum(float(a.get("uiAmount", 0) or 0) for a in accts) or 1
-        rows = sorted(((a.get("address", "?"),
-                        float(a.get("uiAmount", 0) or 0) / total * 100)
-                       for a in accts), key=lambda x: -x[1])[:20]
-        return rows, "rpc"
-    except Exception as e:
-        return None, f"tak tersedia (rugcheck: {err_rc}; rpc: {e})"
+    return None, f"tak tersedia (rpc: {err_rpc}; rugcheck: {err_rc})"
 
 
 def prev_snapshot(mint, today):
