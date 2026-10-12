@@ -32,7 +32,7 @@ def main():
         for r in c.execute("SELECT symbol,entry_usd,status,exit_usd,pnl_usd,exit_reason "
                            "FROM positions ORDER BY id DESC LIMIT 20"):
             print(f"  {r[0]} entry=Rp{r[1]:,.0f} [{r[2]}] exit="
-                  f"{('Rp%0,.0f' % r[3]) if r[3] else '-'} pnl=Rp{(r[4] or 0):,.0f} {r[5] or ''}")
+                  f"{('Rp{:,.0f}'.format(r[3]) if r[3] else '-')} pnl=Rp{(r[4] or 0):,.0f} {r[5] or ''}")
         tot = c.execute("SELECT COUNT(*),COALESCE(SUM(pnl_usd),0) FROM positions WHERE status='closed'").fetchone()
         op = c.execute("SELECT COUNT(*) FROM positions WHERE status='open'").fetchone()[0]
         print(f"  OPEN: {op} | CLOSED: {tot[0]} | total P&L simulasi: Rp{tot[1]:,.0f}")
