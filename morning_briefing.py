@@ -74,7 +74,7 @@ def main():
         pnl = size * (now - entry) / entry if (now and entry) else 0.0
         unreal += pnl
         now_s = money(now) if now else "n/a (hilang dari scout)"
-        open_lines.append(f"- {sym} | entry {money(entry)} -> now {now_s} | P&L {signed(pnl)}")
+        open_lines.append(f"- {sym} | entry {money(entry)} → now {now_s} | P&L {signed(pnl)}")
 
     total_pnl = realized + unreal
     bankroll = START + total_pnl
