@@ -13,8 +13,12 @@ file with virtual prices — there is no live-trading code in this project.
 ## Architecture — 7 agents
 
 ```text
-Scout → News → Sentiment → Charts → Whale → Risk → Decision → Paper Ledger → Report
+Scout → News → Sentiment → Charts → Risk → Decision → Whale → Paper Ledger → Report
 ```
+
+> Order note (v2): Whale runs after Decision, so Risk scores the previous
+> day's whale snapshot (file-per-stage, degrades gracefully); the briefing
+> display merges today's whale by mint.
 
 | # | Agent | File | Input → Output |
 |---|---|---|---|
@@ -22,7 +26,7 @@ Scout → News → Sentiment → Charts → Whale → Risk → Decision → Pape
 | 2 | News | `news.py` | CoinGecko free tier contract lookup → listed/unlisted enrichment (unlisted = higher risk, not an error) |
 | 3 | Sentiment | `sentiment.py` | RugCheck free report (top holders %, mint/freeze authority) + DexScreener txns/volume → holder concentration + hype 0-100 |
 | 4 | Charts | `charts.py` | DexScreener price-change ladder (m5/h1/h6/h24) → momentum/volatility → named pattern + chart score |
-| 5 | Whale | `whale.py` | Top-20 holder snapshots (RugCheck, RPC fallback) vs previous day → akumulasi / distribusi / netral + concentration; stored in `data/whale.db` |
+| 5b | Whale | `whale.py` | Top-20 holders via RPC `getTokenLargestAccounts` first (RugCheck fallback), daily snapshots in `data/whale.db` vs previous day → WHALE MASUK / WHALE KELUAR / akumulasi / distribusi / netral + top-10 concentration |
 | 6 | Risk | `risk.py` | Liquidity, listing, holder concentration, whale concentration/distribution, volatility, age → transparent risk score 1-10 with reasons |
 | 7 | Decision | `decision.py` | `0.35·hype + 0.35·chart + 0.30·(100 − risk·10)` → **AMBIL** (paper buy) / **LEWATI** + written reasons |
 
@@ -34,9 +38,10 @@ Scout → News → Sentiment → Charts → Whale → Risk → Decision → Pape
 Supporting modules:
 
 - `paper_ledger.py` — **replaces a live order manager.** Simulated positions in
-  `data/paper.db` (virtual $100 bankroll, $20/position, max 5 open,
-  TP +25% / SL −15%). Real-cost model deducted on every open AND close:
-  Solana gas $0.05/tx + DEX fee 0.25% + slippage 2% (1% if liquidity > $100k).
+  `data/paper.db` (virtual Rp200.000 bankroll, Rp40.000/position, max 5 open,
+  TP +25% / SL −15%). Axiom real-cost model deducted on every open AND close
+  (each ×2): Axiom fee 0.95% + priority fee 0.001 SOL (Rp2.000 at
+  1 SOL = Rp2.000.000) + DEX fee 0.25% + slippage 2% (1% if liquidity > $100k).
   P&L is reported gross vs net (after costs).
 - `report.py` — daily console report: signals + simulated P&L.
 - `morning_briefing.py` — scheduled runner: full pipeline, mark-to-market,
@@ -46,8 +51,9 @@ Supporting modules:
 
 - DexScreener free API (new profiles, pairs, price-change ladder)
 - CoinGecko free tier (contract lookup; rate-limit friendly ~1 req/7s)
-- RugCheck free report API (holder distribution, authorities)
-- Solana public RPC (fallback for holder data; frequently rate-limited)
+- Solana public RPC `getTokenLargestAccounts` (primary whale/holder source;
+  frequently rate-limited, handled with backoff)
+- RugCheck free report API (holder distribution fallback, authorities)
 
 All API responses are cached as JSON in `cache/`; ledger lives in `data/paper.db`.
 
@@ -61,7 +67,7 @@ python scout.py       # 1. find candidates (live DexScreener data)
 python news.py        # 2. CoinGecko enrichment
 python sentiment.py   # 3. holders + hype
 python charts.py      # 4. trend/volatility/patterns
-python whale.py       # 5. holder snapshots + akumulasi/distribusi
+python whale.py       # 5b. holder snapshots + akumulasi/distribusi (RPC first)
 python risk.py        # 6. risk scores (incl. whale concentration)
 python decision.py    # 7. AMBIL / LEWATI
 python paper_ledger.py  # record paper positions for AMBIL signals
@@ -74,16 +80,16 @@ python morning_briefing.py
 
 ```text
 📊 LAPORAN HARIAN — 2026-10-12
-💰 Bankroll virtual: $92.75 (awal $100)
-📈 P&L total: $-7.25 (-7.25%) — kotor $-5.88 vs bersih $-7.25 (setelah biaya)
+💰 Bankroll virtual: Rp183,811 (awal Rp200.000)
+📈 P&L total: -Rp16,189 (-8.09%) — kotor +Rp10,383 vs bersih -Rp16,189 (setelah biaya)
 
-🟢 POSISI TERBUKA (5):
-- CLAUDINU | entry $0.000275 → now $0.0003021 | P&L $+0.93
+🟢 POSISI TERBUKA (4):
+- CLAUDINU | entry Rp4 → now Rp5 | P&L -Rp2,744
 
 🎯 SINYAL HARI INI (6 kandidat):
-- AMBIL CLAUDINU | skor 67.5 | risk 5/10 | pola parabolic_hot | liq $46,315 | netral
+- AMBIL CLAUDINU | skor 67.5 | risk 5/10 | pola parabolic_hot | liq Rp741,038,400 | 🐋 netral
 
-🤖 STATUS AGEN: Scout ✅ | News ✅ | Sentiment ✅ | Charts ✅ | Whale ✅ | Risk ✅ | Decision ✅
+🤖 STATUS AGEN: Scout ✅ | News ✅ | Sentiment ✅ | Charts ✅ | Risk ✅ | Decision ✅ | Whale ✅
 ```
 
 ## Rules & limits

@@ -23,7 +23,7 @@ EXTRA_STEPS = ["paper_ledger", "report"]
 NAMES = {"scout": "Scout", "news": "News", "sentiment": "Sentiment",
          "charts": "Charts", "risk": "Risk", "decision": "Decision", "whale": "Whale"}
 WHALE_ICON = {"akumulasi": "🐋 akumulasi", "distribusi": "🐋 distribusi",
-              "netral": "netral"}
+              "netral": "🐋 netral"}
 
 
 def sh(args):
