@@ -38,14 +38,18 @@ Scout → News → Sentiment → Charts → Risk → Decision → Whale → Pape
 Supporting modules:
 
 - `paper_ledger.py` — **replaces a live order manager.** Simulated positions in
-  `data/paper.db` (virtual Rp200.000 bankroll, Rp40.000/position, max 5 open,
-  TP +25% / SL −15%). Axiom real-cost model deducted on every open AND close
+  `data/paper.db` (virtual Rp200.000 bankroll, Rp40.000/position,
+  max 1 open per token, max 3 open total, TP +25% / SL −15%).
+  Re-entry on a token only after its previous position closed.
+  Each run closes TP/SL hits BEFORE recording new signals.
   (each ×2): Axiom fee 0.95% + priority fee 0.001 SOL (Rp2.000 at
   1 SOL = Rp2.000.000) + DEX fee 0.25% + slippage 2% (1% if liquidity > $100k).
   P&L is reported gross vs net (after costs).
 - `report.py` — daily console report: signals + simulated P&L.
-- `morning_briefing.py` — scheduled runner: full pipeline, mark-to-market,
-  record signals, write `reports/YYYY-MM-DD.md`, commit + push.
+- `morning_briefing.py` — scheduled runner (4x daily: 07:00, 12:00, 17:00,
+  22:00 WITA): full pipeline, mark-to-market (close TP/SL first),
+  record signals (max 1/token, max 3 total), write
+  `reports/YYYY-MM-DD-HHmm.md`, commit + push.
 
 ## Data sources (all free, no keys)
 
@@ -79,14 +83,14 @@ python morning_briefing.py
 ## Example output
 
 ```text
-📊 LAPORAN HARIAN — 2026-10-12
+📊 LAPORAN — 2026-10-12 17:00
 💰 Bankroll virtual: Rp183,811 (awal Rp200.000)
 📈 P&L total: -Rp16,189 (-8.09%) — kotor +Rp10,383 vs bersih -Rp16,189 (setelah biaya)
 
-🟢 POSISI TERBUKA (4):
+🟢 POSISI TERBUKA (4/3):
 - CLAUDINU | entry Rp4 → now Rp5 | P&L -Rp2,744
 
-🎯 SINYAL HARI INI (6 kandidat):
+🎯 SINYAL RUN INI (6 kandidat):
 - AMBIL CLAUDINU | skor 67.5 | risk 5/10 | pola parabolic_hot | liq Rp741,038,400 | 🐋 netral
 
 🤖 STATUS AGEN: Scout ✅ | News ✅ | Sentiment ✅ | Charts ✅ | Risk ✅ | Decision ✅ | Whale ✅

@@ -1,11 +1,14 @@
-"""Morning briefing runner: full paper-trading pipeline -> daily report file + briefing text.
+"""Briefing runner (v3, 4x daily): full paper-trading pipeline -> per-run report + briefing text.
 
 SIMULATION ONLY. No wallets, no private keys, no live orders.
 Pipeline v2: scout -> news -> sentiment -> charts -> risk -> decision ->
 whale -> paper_ledger -> report.
 Whale runs after decision; risk scores use the previous whale snapshot
 (file-per-stage, degrades gracefully). Display merges today's whale by mint.
-Steps: run agents -> mark-to-market -> record AMBIL -> write
+Steps: run agents -> mark-to-market (close TP/SL hits FIRST) ->
+record new AMBIL (max 1/token, max 3 total, re-entry only after close) ->
+write reports/YYYY-MM-DD-HHmm.md -> git commit+push -> print briefing (stdout).
+Runs 4x daily (07:00, 12:00, 17:00, 22:00 WITA).
 """
 import json
 import os
@@ -55,7 +58,10 @@ def signed(x):
 
 
 def main():
-    day = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now()
+    day = now.strftime("%Y-%m-%d")
+    stamp = now.strftime("%Y-%m-%d-%H%M")
+    label = now.strftime("%Y-%m-%d %H:%M")
     status = {}
     for a in AGENTS + EXTRA_STEPS:
         r = sh([PY, f"{a}.py"])
@@ -130,19 +136,19 @@ def main():
 
     agen = " | ".join(f"{NAMES[a]} {'✅' if status[a] else '❌'}" for a in AGENTS)
 
-    msg = (f"📊 LAPORAN HARIAN — {day}\n"
+    msg = (f"📊 LAPORAN — {label}\n"
            f"💰 Bankroll virtual: Rp{bankroll:,.0f} (awal Rp200.000)\n"
            f"📈 P&L total: {rp_signed(net_total)} ({pct:+.2f}%) — "
            f"kotor {rp_signed(gross_total)} vs bersih {rp_signed(net_total)} (setelah biaya)\n"
-           f"\n🟢 POSISI TERBUKA ({len(opens)}):\n"
+           f"\n🟢 POSISI TERBUKA ({len(opens)}/3):\n"
            + ("\n".join(open_lines) if open_lines else "- tidak ada posisi terbuka") + "\n"
-           f"\n🎯 SINYAL HARI INI ({len(decs)} kandidat):\n"
+           f"\n🎯 SINYAL RUN INI ({len(decs)} kandidat):\n"
            + "\n".join(sig_lines) + "\n"
            f"\n🤖 STATUS AGEN: {agen}")
 
-    rep = ROOT / "reports" / f"{day}.md"
+    rep = ROOT / "reports" / f"{stamp}.md"
     rep.parent.mkdir(exist_ok=True)
-    det = [f"# Laporan Harian — {day}", "",
+    det = [f"# Laporan — {label}", "",
            f"Bankroll virtual: Rp{bankroll:,.0f} (awal Rp200.000)",
            f"P&L kotor {rp_signed(gross_total)} vs bersih {rp_signed(net_total)} ({pct:+.2f}%) "
            f"= realisasi bersih {rp_signed(rn)} (biaya closed {rp_signed(-closed_costs)}) "
@@ -176,8 +182,8 @@ def main():
 
     push_note = ""
     try:
-        sh(["git", "add", f"reports/{day}.md"])
-        sh(["git", "commit", "-m", f"Morning briefing {day}"])
+        sh(["git", "add", f"reports/{stamp}.md"])
+        sh(["git", "commit", "-m", f"Briefing {stamp}"])
         r = sh(["git", "push", "origin", "main"])
         if r.returncode != 0:
             push_note = f"\n\n(push gagal: {(r.stderr or '')[-200:]})"
