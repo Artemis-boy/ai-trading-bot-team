@@ -139,9 +139,12 @@ def summary():
     return rows
 
 
-def record_signals(decisions, max_open=5):
-    """Open paper positions for fresh AMBIL signals (skip mints already open).
-    Bankroll Rp200.000 virtual, Rp40.000/posisi, maks 5 posisi terbuka."""
+def record_signals(decisions, max_open=3):
+    """Open paper positions for fresh AMBIL signals.
+    v3 rules: max 1 open position per token (skip mints already open),
+    max 3 open positions total. Re-entry on a token only after its
+    previous position closed (TP/SL evaluated before this runs).
+    Bankroll Rp200.000 virtual, Rp40.000/posisi."""
     c = conn()
     already = {r[0] for r in c.execute("SELECT mint FROM positions WHERE status='open'")}
     n_open = c.execute("SELECT COUNT(*) FROM positions WHERE status='open'").fetchone()[0]
