@@ -172,7 +172,7 @@ def analyze(cands, today=None):
 
 
 def main():
-    src = CACHE / "decision_latest.json"
+    src = CACHE / "charts_latest.json"
     cands = json.loads(src.read_text())
     print(f"[whale] analyzing {len(cands)} candidates...")
     out = analyze(cands)
