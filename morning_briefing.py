@@ -73,7 +73,7 @@ def main():
         now = prices.get(mint)
         pnl = size * (now - entry) / entry if (now and entry) else 0.0
         unreal += pnl
-        now_s = money(now)
+        now_s = money(now) if now else "n/a (hilang dari scout)"
         open_lines.append(f"- {sym} | entry {money(entry)} -> now {now_s} | P&L {signed(pnl)}")
 
     total_pnl = realized + unreal
