@@ -10,9 +10,87 @@ Currency: IDR. Real-cost model Axiom (deducted on every open AND close):
 P&L stored NET (kotor minus costs); gross P&L and cost breakdown kept
 in fee columns for reporting.
 """
-import json
+# --- Entry filter utilities ---
+from datetime import datetime, timezone, timedelta
+
+def token_age_ok(decision):
+    """Return True if token age >= 1 hour (3600 seconds).
+    Uses ``pair_age_days`` if present; if missing, treat as unknown and accept.
+    """
+    pair_days = decision.get('pair_age_days')
+    if pair_days is not None:
+        try:
+            age_seconds = float(pair_days) * 86400
+            return age_seconds >= 3600
+        except Exception:
+            pass
+    # Unknown age → accept
+    return True
+
+def liquidity_ok(decision):
+    """Return True if liquidity >= Rp500 million (≈ $31k)."""
+    # Use explicit liquidity fields; if missing, treat as unknown → accept.
+    liq_idr = decision.get('liquidity_idr')
+    if liq_idr is None:
+        liq_usd = decision.get('liquidity_usd')
+        if liq_usd is not None:
+            liq_idr = liq_usd * 16000
+    # If still None, liquidity unknown → do not block
+    if liq_idr is None:
+        return True
+    return liq_idr >= 500_000_000
+
+
+def allow_parabolic_hot(decision):
+    """Extra confirmations for pattern ``parabolic_hot``.
+    - Token age ≥ 1 hour (handled by token_age_ok).
+    - Liquidity must be stable: ``liquidity_change_pct`` must NOT be < -30 (no >30 % drop).
+    - Price pull‑back from recent peak must be ≥ 5 % (price fell ≥5 %).
+    Returns True only if all three conditions are met.
+    """
+    # Age check – token_age_ok already uses 1‑hour threshold
+    if not token_age_ok(decision):
+        return False
+    # Liquidity stability check
+    liq_change = decision.get('liquidity_change_pct') or 0
+    if liq_change < -30:
+        return False
+    # Price pull‑back calculation
+    price_old = float(decision.get('price_usd') or 0)
+    price_now = float(decision.get('chart', {}).get('price_usd_now') or 0)
+    if price_old <= 0:
+        return False
+    pullback_pct = (price_old - price_now) / price_old * 100
+    if pullback_pct < 5:
+        return False
+    return True
+
+def not_parabolic_hot(decision):
+    """Return True if pattern is not 'parabolic_hot'."""
+    return decision.get('pattern') != 'parabolic_hot'
+
+def lp_locked(decision):
+    """Return True if LP is locked/burned OR if data missing (unknown) → accept."""
+    # If both fields missing, treat as unknown and allow
+    if decision.get('lp_locked') is None and decision.get('lp_burned') is None:
+        return True
+    return bool(decision.get('lp_locked') or decision.get('lp_burned'))
+
+
+def should_enter(decision):
+    """Apply entry filters.
+    * If pattern == 'parabolic_hot' → invoke ``allow_parabolic_hot`` (age + liquidity stability + pull‑back).
+    * Otherwise (e.g., 'steady_climb') → apply the basic filters only (age, liquidity, LP‑lock).
+    """
+    pattern = (decision.get('chart') or {}).get('pattern')
+    if pattern == 'parabolic_hot':
+        return allow_parabolic_hot(decision)
+    # Non‑parabolic patterns: basic filters only
+    return token_age_ok(decision) and liquidity_ok(decision) and lp_locked(decision)
+
 import sqlite3
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -20,9 +98,28 @@ DB = ROOT / "data" / "paper.db"
 CACHE = ROOT / "cache"
 DB.parent.mkdir(exist_ok=True)
 
+# Initialize portfolio table (single‑row ledger) if missing
+def _init_portfolio(conn):
+    conn.execute('''CREATE TABLE IF NOT EXISTS portfolio (
+        id INTEGER PRIMARY KEY,
+        cash_balance INTEGER NOT NULL,
+        total_equity INTEGER NOT NULL,
+        realized_pnl INTEGER NOT NULL,
+        unrealized_pnl INTEGER NOT NULL,
+        total_writeoff INTEGER NOT NULL,
+        topup_history TEXT NOT NULL
+    )''')
+    # ensure a single row exists (id=1)
+    cur = conn.execute('SELECT COUNT(*) FROM portfolio')
+    if cur.fetchone()[0] == 0:
+        # start with STARTING_BANKROLL as cash and equity; other fields zero
+        conn.execute('INSERT INTO portfolio (id, cash_balance, total_equity, realized_pnl, unrealized_pnl, total_writeoff, topup_history) VALUES (1, ?, ?, 0, 0, 0, "[]")',
+                     (STARTING_BANKROLL, STARTING_BANKROLL))
+        conn.commit()
+
 TAKE_PROFIT_PCT = 25.0
 STOP_LOSS_PCT = -15.0
-STARTING_BANKROLL = 200_000  # Rp
+STARTING_BANKROLL = 350_000  # Rp (after top‑up of Rp150.000 on 13 Oct 2026 18:06)
 PAPER_SIZE = 40_000  # Rp per posisi (20%), maks 5 posisi terbuka
 
 USD_IDR = 16_000  # kurs konversi harga token USD -> IDR
@@ -43,14 +140,21 @@ def trade_cost(notional_idr, liquidity_usd=0):
 
 def conn():
     c = sqlite3.connect(DB)
+    # Ensure portfolio table exists (single‑row ledger)
+    _init_portfolio(c)
+    # Create positions table if missing
     c.execute("""CREATE TABLE IF NOT EXISTS positions(
       id INTEGER PRIMARY KEY, opened_at TEXT, mint TEXT, symbol TEXT,
       entry_usd REAL, size_usd REAL, tp_pct REAL, sl_pct REAL,
       status TEXT DEFAULT 'open', closed_at TEXT, exit_usd REAL, pnl_usd REAL,
       exit_reason TEXT, entry_cost_usd REAL DEFAULT 0, exit_cost_usd REAL DEFAULT 0,
       pnl_gross_usd REAL DEFAULT 0, liquidity_usd REAL DEFAULT 0)""")
-    # migrate old DBs
+    # Get existing column names
     cols = {r[1] for r in c.execute("PRAGMA table_info(positions)")}
+    # Add missing is_writeoff flag
+    if 'is_writeoff' not in cols:
+        c.execute('ALTER TABLE positions ADD COLUMN is_writeoff INTEGER DEFAULT 0')
+    # Add any other missing columns
     for col, typ in [("entry_cost_usd", "REAL DEFAULT 0"), ("exit_cost_usd", "REAL DEFAULT 0"),
                      ("pnl_gross_usd", "REAL DEFAULT 0"), ("liquidity_usd", "REAL DEFAULT 0"),
                      ("miss_count", "INTEGER DEFAULT 0")]:
@@ -69,10 +173,14 @@ def open_position(mint, symbol, entry_price_usd, size=PAPER_SIZE,
     entry = usd_to_idr(entry_price_usd)
     c = conn()
     ecost = trade_cost(size, liquidity_usd)
+    # Insert position
     c.execute("INSERT INTO positions(opened_at,mint,symbol,entry_usd,size_usd,tp_pct,sl_pct,"
               "entry_cost_usd,liquidity_usd) VALUES(?,?,?,?,?,?,?,?,?)",
               (datetime.now(timezone.utc).isoformat(), mint, symbol, entry, size, tp, sl,
                ecost, liquidity_usd))
+    # Update portfolio cash and equity (reserve size + entry cost)
+    c.execute("UPDATE portfolio SET cash_balance = cash_balance - ?, total_equity = total_equity - ? WHERE id=1",
+              (size + ecost, size + ecost))
     c.commit()
     pid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     c.close()
@@ -81,7 +189,8 @@ def open_position(mint, symbol, entry_price_usd, size=PAPER_SIZE,
 
 def mark_to_market(price_map_usd):
     """Evaluate open positions vs {mint: price_now_usd}. Returns closed list.
-    Prices converted to IDR; P&L stored NET: gross minus entry cost minus exit cost."""
+    Prices converted to IDR; P&L stored NET: gross minus entry cost minus exit cost.
+    Updates portfolio cash, equity, realized P&L and write‑off counters atomically."""
     price_map = {m: usd_to_idr(p) for m, p in (price_map_usd or {}).items() if p}
     c = conn()
     closed = []
@@ -89,18 +198,21 @@ def mark_to_market(price_map_usd):
             "SELECT id,mint,symbol,entry_usd,size_usd,tp_pct,sl_pct,"
             "entry_cost_usd,liquidity_usd FROM positions WHERE status='open'"):
         if mint not in price_map or not price_map[mint]:
-            c.execute("UPDATE positions SET miss_count=COALESCE(miss_count,0)+1 WHERE id=?",
-                      (pid,))
-            miss = c.execute("SELECT miss_count FROM positions WHERE id=?",
-                             (pid,)).fetchone()[0]
+            # price missing -> increment miss counter
+            c.execute("UPDATE positions SET miss_count=COALESCE(miss_count,0)+1 WHERE id=?", (pid,))
+            miss = c.execute("SELECT miss_count FROM positions WHERE id=?", (pid,)).fetchone()[0]
             if (miss or 0) >= 2:
-                # ⚠️ HILANG 2 run berturut-turut (kemungkinan rug): rugi total.
+                # write‑off after two consecutive missing prices
                 net = round(-(size or 0) - (ecost or 0), 0)
                 c.execute("UPDATE positions SET status='closed',closed_at=?,exit_usd=0,"
-                          "pnl_usd=?,pnl_gross_usd=?,exit_reason=? WHERE id=?",
+                          "pnl_usd=?,pnl_gross_usd=?,exit_reason='WRITE_OFF', is_writeoff=1 WHERE id=?",
                           (datetime.now(timezone.utc).isoformat(), net,
-                           round(-(size or 0), 0), "⚠️ HILANG (kemungkinan rug)", pid))
-                closed.append((sym, "⚠️ HILANG (kemungkinan rug)", net))
+                           round(-(size or 0), 0), pid))
+                # portfolio adjustments for write‑off
+                c.execute("UPDATE portfolio SET cash_balance = cash_balance - ?, total_equity = total_equity - ?, "
+                          "realized_pnl = realized_pnl + ?, total_writeoff = total_writeoff + ? WHERE id=1",
+                          (size + ecost, size + ecost, net, size + ecost))
+                closed.append((sym, "WRITE_OFF", net))
             continue
         px = float(price_map[mint])
         c.execute("UPDATE positions SET miss_count=0 WHERE id=?", (pid,))
@@ -115,9 +227,13 @@ def mark_to_market(price_map_usd):
             xcost = trade_cost(size * (1 + pct / 100), liq or 0)
             net = round(gross - (ecost or 0) - xcost, 0)
             c.execute("UPDATE positions SET status='closed',closed_at=?,exit_usd=?,"
-                      "pnl_usd=?,pnl_gross_usd=?,exit_cost_usd=?,exit_reason=? WHERE id=?",
+                      "pnl_usd=?,pnl_gross_usd=?,exit_cost_usd=?,exit_reason=?, is_writeoff=0 WHERE id=?",
                       (datetime.now(timezone.utc).isoformat(), px, net,
                        round(gross, 0), xcost, reason, pid))
+            # portfolio adjustments for normal close
+            c.execute("UPDATE portfolio SET cash_balance = cash_balance + ?, total_equity = total_equity + ?, "
+                      "realized_pnl = realized_pnl + ? WHERE id=1",
+                      (net, net, net))
             closed.append((sym, reason, net))
     c.commit()
     c.close()
@@ -173,7 +289,11 @@ def record_signals(decisions, max_open=3):
     c.close()
     n = 0
     for d in decisions:
+        # Apply entry filters before opening a position
         if d.get("signal") != "AMBIL" or d["mint"] in already:
+            continue
+        if not should_enter(d):
+            # Skip tokens that do not satisfy all entry criteria
             continue
         if n_open + n >= max_open:
             break
@@ -188,16 +308,30 @@ def record_signals(decisions, max_open=3):
     return n
 
 
-def totals():
-    """(realized_gross, realized_net, total_costs) over closed positions."""
+def close_memecoin_positions():
+    """Close any open memecoin position after 24h if not already closed.
+    Uses the opened_at timestamp to compute age and closes with net loss.
+    Marks the row as a write‑off (is_writeoff=1) and updates portfolio accordingly.
+    """
     c = conn()
-    g, n_, ec, xc = c.execute(
-        "SELECT COALESCE(SUM(pnl_gross_usd),0),COALESCE(SUM(pnl_usd),0),"
-        "COALESCE(SUM(entry_cost_usd),0),COALESCE(SUM(exit_cost_usd),0)"
-        " FROM positions WHERE status='closed'").fetchone()
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    rows = c.execute("SELECT id, opened_at, size_usd, entry_cost_usd FROM positions WHERE status='open'").fetchall()
+    for pid, opened_at, size, ecost in rows:
+        opened_dt = datetime.fromisoformat(opened_at)
+        if opened_dt <= cutoff:
+            gross = - (size or 0)
+            net = gross - (ecost or 0)
+            c.execute(
+                "UPDATE positions SET status='closed',closed_at=?,exit_usd=0,"
+                "pnl_usd=?,pnl_gross_usd=?,exit_reason='WRITE_OFF', is_writeoff=1 WHERE id=?",
+                (now.isoformat(), net, gross, pid))
+            # portfolio adjustments for write‑off (cash and equity decrease, realized P&L records loss, write‑off total increments)
+            c.execute("UPDATE portfolio SET cash_balance = cash_balance - ?, total_equity = total_equity - ?, "
+                      "realized_pnl = realized_pnl + ?, total_writeoff = total_writeoff + ? WHERE id=1",
+                      (size + ecost, size + ecost, net, size + ecost))
+    c.commit()
     c.close()
-    return round(g, 0), round(n_, 0), round((ec or 0) + (xc or 0), 0)
-
 
 def main():
     decs = json.loads((CACHE / "decision_latest.json").read_text())
