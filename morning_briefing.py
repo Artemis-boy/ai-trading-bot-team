@@ -123,9 +123,28 @@ def main():
             open_lines.append(f"- {sym} | entry {rp(entry)} → now {rp(now)} | P&L {rp_signed(pnl)}")
 
     gross_total = rg + ug
+    conn = ledger.conn()
+    # Retrieve cash_balance and topup_history (the JSON list of top‑ups) from the portfolio table.
+    # Retrieve cash_balance and full topup_history JSON (column index 6)
+    row = conn.execute('SELECT cash_balance, total_equity, topup_history FROM portfolio WHERE id=1').fetchone()
+    cash_balance = row[0]
+    total_equity = row[1]
+    topup_history_json = row[2]
+    # Keep total_equity in sync with cash_balance when there are no open positions
+    if cash_balance != total_equity:
+        conn.execute('UPDATE portfolio SET total_equity = ? WHERE id = 1', (cash_balance,))
+        conn.commit()
+
+    # total deposit = initial 200 000 plus sum of all top‑ups recorded
+    try:
+        topups = json.loads(topup_history_json)
+        total_topup = sum(item.get('amount', 0) for item in topups)
+    except Exception:
+        total_topup = 0
+    total_deposit = 200_000 + total_topup
+    bankroll = cash_balance
     net_total = rn + un
-    bankroll = START + net_total
-    pct = net_total / START * 100
+    pct = net_total / total_deposit * 100
 
     sig_lines = []
     for d in decs:
@@ -140,7 +159,7 @@ def main():
     agen = " | ".join(f"{NAMES[a]} {'✅' if status[a] else '❌'}" for a in AGENTS)
 
     msg = (f"📊 LAPORAN — {label}\n"
-           f"💰 Bankroll virtual: Rp{bankroll:,.0f} (awal Rp200.000)\n"
+           f"💰 Bankroll virtual: Rp{bankroll:,.0f} (awal Rp{total_deposit:,.0f})\n"
            f"📈 P&L total: {rp_signed(net_total)} ({pct:+.2f}%) — "
            f"kotor {rp_signed(gross_total)} vs bersih {rp_signed(net_total)} (setelah biaya)\n"
            f"\n🟢 POSISI TERBUKA ({len(open_lines)}/3):\n"
@@ -154,7 +173,7 @@ def main():
     rep = ROOT / "reports" / f"{stamp}.md"
     rep.parent.mkdir(exist_ok=True)
     det = [f"# Laporan — {label}", "",
-           f"Bankroll virtual: Rp{bankroll:,.0f} (awal Rp200.000)",
+           f"Bankroll virtual: Rp{bankroll:,.0f} (awal Rp{total_deposit:,.0f})",
            f"P&L kotor {rp_signed(gross_total)} vs bersih {rp_signed(net_total)} ({pct:+.2f}%) "
            f"= realisasi bersih {rp_signed(rn)} (biaya closed {rp_signed(-closed_costs)}) "
            f"+ unrealisasi bersih {rp_signed(un)} (biaya open {rp_signed(-(open_costs or 0))}).",

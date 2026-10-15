@@ -11,6 +11,48 @@ P&L stored NET (kotor minus costs); gross P&L and cost breakdown kept
 in fee columns for reporting.
 """
 # --- Entry filter utilities ---
+
+# ---------------------------------------------------------------------------
+# Top‑up handling
+# ---------------------------------------------------------------------------
+
+def record_topup(amount: int, date: str = None) -> None:
+    """Record a cash top‑up.
+    * Increases ``cash_balance`` and ``total_equity`` by *amount*.
+    * Appends a dict ``{"date": date, "amount": amount}`` to ``topup_history`` JSON.
+    * If *date* is None, uses current ISO date.
+    """
+    import json, datetime
+    # Use WITA (UTC+8) for the date stamp
+    wita_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    c = conn()
+
+
+    entry_date = date or wita_now.date().isoformat()
+
+    # fetch current portfolio row
+    row = c.execute('SELECT cash_balance, total_equity, topup_history FROM portfolio WHERE id=1').fetchone()
+    if not row:
+        raise RuntimeError('Portfolio row missing')
+    cash, equity, topup_json = row
+    # parse existing history
+    try:
+        history = json.loads(topup_json)
+    except Exception:
+        history = []
+    # prepare entry
+    entry_date = date or datetime.datetime.utcnow().date().isoformat()
+    history.append({"date": entry_date, "amount": amount})
+    new_json = json.dumps(history)
+    # update portfolio
+    new_cash = cash + amount
+    new_equity = equity + amount
+    c.execute('UPDATE portfolio SET cash_balance = ?, total_equity = ?, topup_history = ? WHERE id = 1',
+              (new_cash, new_equity, new_json))
+    c.commit()
+    c.close()
+
+
 from datetime import datetime, timezone, timedelta
 
 def token_age_ok(decision):
@@ -100,6 +142,32 @@ DB.parent.mkdir(exist_ok=True)
 
 # Initialize portfolio table (single‑row ledger) if missing
 def _init_portfolio(conn):
+    # Existing portfolio table
+    conn.execute('''CREATE TABLE IF NOT EXISTS portfolio (
+        id INTEGER PRIMARY KEY,
+        cash_balance INTEGER NOT NULL,
+        total_equity INTEGER NOT NULL,
+        realized_pnl INTEGER NOT NULL,
+        unrealized_pnl INTEGER NOT NULL,
+        total_writeoff INTEGER NOT NULL,
+        topup_history TEXT NOT NULL
+    )''')
+    # Create cash transaction log (append‑only)
+    conn.execute('''CREATE TABLE IF NOT EXISTS cash_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        event TEXT NOT NULL,
+        position_id INTEGER,
+        cash_delta INTEGER NOT NULL,
+        balance INTEGER NOT NULL
+    )''')
+    # ensure a single row exists (id=1)
+    cur = conn.execute('SELECT COUNT(*) FROM portfolio')
+    if cur.fetchone()[0] == 0:
+        conn.execute('INSERT INTO portfolio (id, cash_balance, total_equity, realized_pnl, unrealized_pnl, total_writeoff, topup_history) VALUES (1, ?, ?, 0, 0, 0, "[]")',
+                     (STARTING_BANKROLL, STARTING_BANKROLL))
+    conn.commit()
+    return conn
     conn.execute('''CREATE TABLE IF NOT EXISTS portfolio (
         id INTEGER PRIMARY KEY,
         cash_balance INTEGER NOT NULL,
@@ -173,19 +241,32 @@ def open_position(mint, symbol, entry_price_usd, size=PAPER_SIZE,
     entry = usd_to_idr(entry_price_usd)
     c = conn()
     ecost = trade_cost(size, liquidity_usd)
-    # Insert position
+    # Insert position first
     c.execute("INSERT INTO positions(opened_at,mint,symbol,entry_usd,size_usd,tp_pct,sl_pct,"
               "entry_cost_usd,liquidity_usd) VALUES(?,?,?,?,?,?,?,?,?)",
               (datetime.now(timezone.utc).isoformat(), mint, symbol, entry, size, tp, sl,
                ecost, liquidity_usd))
-    # Update portfolio cash and equity (reserve size + entry cost)
+    pid = c.execute('SELECT last_insert_rowid()').fetchone()[0]
+    # Reserve capital in portfolio
     c.execute("UPDATE portfolio SET cash_balance = cash_balance - ?, total_equity = total_equity - ? WHERE id=1",
               (size + ecost, size + ecost))
+    # Log reservation (negative delta)
+    c.execute("INSERT INTO cash_log (ts, event, position_id, cash_delta, balance) VALUES (?,?,?, ?, (SELECT cash_balance FROM portfolio WHERE id=1))",
+              (datetime.now(timezone(timedelta(hours=8))).isoformat(), 'OPEN', pid, -(size + ecost)))
     c.commit()
-    pid = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     c.close()
     return pid
 
+
+
+
+def _update_equity(c):
+    """Re‑compute total_equity = cash_balance + nilai posisi terbuka (size+entry_cost)."""
+    cash = c.execute('SELECT cash_balance FROM portfolio WHERE id=1').fetchone()[0]
+    open_val = c.execute('SELECT COALESCE(SUM(size_usd + entry_cost_usd),0) FROM positions WHERE status="open"').fetchone()[0]
+    total = cash + (open_val or 0)
+    c.execute('UPDATE portfolio SET total_equity = ? WHERE id=1', (total,))
+    # No commit here; caller will commit.
 
 def mark_to_market(price_map_usd):
     """Evaluate open positions vs {mint: price_now_usd}. Returns closed list.
@@ -208,12 +289,20 @@ def mark_to_market(price_map_usd):
                           "pnl_usd=?,pnl_gross_usd=?,exit_reason='WRITE_OFF', is_writeoff=1 WHERE id=?",
                           (datetime.now(timezone.utc).isoformat(), net,
                            round(-(size or 0), 0), pid))
-                # portfolio adjustments for write‑off
-                c.execute("UPDATE portfolio SET cash_balance = cash_balance - ?, total_equity = total_equity - ?, "
-                          "realized_pnl = realized_pnl + ?, total_writeoff = total_writeoff + ? WHERE id=1",
-                          (size + ecost, size + ecost, net, size + ecost))
+                # cash already deducted on OPEN; only update realized P&L and total write‑off
+                c.execute("UPDATE portfolio SET realized_pnl = realized_pnl + ?, total_writeoff = total_writeoff + ? WHERE id=1",
+                          (net, size + ecost))
+                # Log write‑off (delta 0, balance unchanged)
+                c.execute("SELECT cash_balance FROM portfolio WHERE id=1")
+                _bal = c.fetchone()[0]
+                c.execute("INSERT INTO cash_log (ts, event, position_id, cash_delta, balance) VALUES (?,?,?,?,?)",
+                          (datetime.now(timezone(timedelta(hours=8))).isoformat(), 'WRITE_OFF', pid, 0, _bal))
                 closed.append((sym, "WRITE_OFF", net))
-            continue
+                continue
+            elif (miss or 0) == 1:
+                # Defer single missing price handling until after loop (DROP)
+                continue
+
         px = float(price_map[mint])
         c.execute("UPDATE positions SET miss_count=0 WHERE id=?", (pid,))
         pct = (px - entry) / entry * 100
@@ -230,14 +319,30 @@ def mark_to_market(price_map_usd):
                       "pnl_usd=?,pnl_gross_usd=?,exit_cost_usd=?,exit_reason=?, is_writeoff=0 WHERE id=?",
                       (datetime.now(timezone.utc).isoformat(), px, net,
                        round(gross, 0), xcost, reason, pid))
-            # portfolio adjustments for normal close
+            # Model A: add full proceeds (size + entry_cost + net)
+            proceeds = size + ecost + net
             c.execute("UPDATE portfolio SET cash_balance = cash_balance + ?, total_equity = total_equity + ?, "
                       "realized_pnl = realized_pnl + ? WHERE id=1",
-                      (net, net, net))
-            closed.append((sym, reason, net))
-    c.commit()
-    c.close()
-    return closed
+                      (proceeds, proceeds, net))
+            # Log cash movement (proceeds)
+            c.execute("INSERT INTO cash_log (ts, event, position_id, cash_delta, balance) VALUES (?,?,?, ?, (SELECT cash_balance FROM portfolio WHERE id=1))",
+                      (datetime.now(timezone(timedelta(hours=8))).isoformat(), 'CLOSE', pid, proceeds))
+            # After processing all positions, handle any single‑miss drops.
+            drop_rows = c.execute("SELECT id, size_usd, entry_cost_usd FROM positions WHERE status='open' AND miss_count=1").fetchall()
+            for drop_id, size_drop, ecost_drop in drop_rows:
+                refund = size_drop + ecost_drop
+                c.execute("UPDATE positions SET status='closed',closed_at=?,exit_usd=0,"
+                          "pnl_usd=0,pnl_gross_usd=0,exit_reason='DROPPED', is_writeoff=0 WHERE id=?",
+                          (datetime.now(timezone.utc).isoformat(), drop_id))
+                c.execute("UPDATE portfolio SET cash_balance = cash_balance + ?, total_equity = total_equity + ? WHERE id=1",
+                          (refund, refund))
+                # Log DROP (cash_delta = refund)
+                c.execute("INSERT INTO cash_log (ts, event, position_id, cash_delta, balance) VALUES (?,?,?, ?, (SELECT cash_balance FROM portfolio WHERE id=1))",
+                          (datetime.now(timezone(timedelta(hours=8))).isoformat(), 'DROP', drop_id, refund))
+                closed.append(("DROPPED", refund))
+            c.commit()
+            c.close()
+            return closed
 
 
 def unrealized(price_map_usd):
@@ -332,6 +437,18 @@ def close_memecoin_positions():
                       (size + ecost, size + ecost, net, size + ecost))
     c.commit()
     c.close()
+
+def totals():
+    """Return (gross_total, net_total, closed_costs) for closed positions.
+    gross_total: sum of pnl_gross_usd (including write-offs where gross is negative size)
+    net_total: sum of pnl_usd (net after entry and exit costs)
+    closed_costs: sum of entry_cost_usd + exit_cost_usd for all closed positions.
+    """
+    c = conn()
+    row = c.execute("SELECT COALESCE(SUM(pnl_gross_usd),0), COALESCE(SUM(pnl_usd),0), COALESCE(SUM(entry_cost_usd + exit_cost_usd),0) FROM positions WHERE status='closed'").fetchone()
+    c.close()
+    return row[0] or 0, row[1] or 0, row[2] or 0
+
 
 def main():
     decs = json.loads((CACHE / "decision_latest.json").read_text())
